@@ -303,6 +303,15 @@ defmodule ReqLLM.Error do
     end
   end
 
+  @doc false
+  @spec log_metadata(term()) :: keyword()
+  def log_metadata(%{__struct__: type, status: status})
+      when is_atom(type) and is_integer(status),
+      do: [error_type: type, http_status: status]
+
+  def log_metadata(%{__struct__: type}) when is_atom(type), do: [error_type: type]
+  def log_metadata(_reason), do: [error_type: :unknown]
+
   @doc """
   Creates a validation error with the given tag, reason, and context.
 

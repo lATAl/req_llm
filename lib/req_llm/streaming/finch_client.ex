@@ -199,19 +199,20 @@ defmodule ReqLLM.Streaming.FinchClient do
               :ok
 
             {:error, reason, _callback_acc} ->
-              Logger.error("Finch streaming failed: #{inspect(reason)}")
+              Logger.error("Finch streaming failed", ReqLLM.Error.log_metadata(reason))
               safe_http_event(stream_server_pid, {:error, reason})
               {:error, reason}
           end
         catch
           :exit, reason ->
-            Logger.error("Finch streaming task exited: #{inspect(reason)}")
+            Logger.error("Finch streaming task exited", ReqLLM.Error.log_metadata(reason))
             safe_http_event(stream_server_pid, {:error, {:exit, reason}})
             {:error, {:exit, reason}}
 
           kind, reason ->
             Logger.error(
-              "Finch streaming task crashed (kind=#{inspect(kind)}): #{inspect(reason)}"
+              "Finch streaming task crashed (kind=#{kind})",
+              ReqLLM.Error.log_metadata(reason)
             )
 
             safe_http_event(stream_server_pid, {:error, {kind, reason}})

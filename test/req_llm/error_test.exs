@@ -3,6 +3,23 @@ defmodule ReqLLM.ErrorTest do
 
   alias ReqLLM.Error
 
+  test "log metadata allowlists only error type and integer HTTP status" do
+    error =
+      Error.API.Request.exception(
+        reason: "private",
+        status: 429,
+        response_body: %{"secret" => "private"},
+        request_body: "private",
+        cause: "private",
+        headers: [{"authorization", "private"}]
+      )
+
+    assert Error.log_metadata(error) == [error_type: Error.API.Request, http_status: 429]
+    assert Error.log_metadata(%{error | status: "private"}) == [error_type: Error.API.Request]
+    assert Error.log_metadata({:error, error}) == [error_type: :unknown]
+    assert Error.log_metadata("private") == [error_type: :unknown]
+  end
+
   # Shared test helpers
   defp assert_error_fields(error, expected_fields) do
     assert error.__exception__ == true

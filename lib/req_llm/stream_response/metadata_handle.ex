@@ -40,13 +40,14 @@ defmodule ReqLLM.StreamResponse.MetadataHandle do
       rescue
         error ->
           Logger.warning(
-            "Metadata collection failed: #{Exception.format(:error, error, __STACKTRACE__)}"
+            "Metadata collection failed",
+            ReqLLM.Error.log_metadata(error)
           )
 
           %{}
       catch
         :exit, reason ->
-          Logger.warning("Metadata collection exited: #{inspect(reason)}")
+          Logger.warning("Metadata collection exited", ReqLLM.Error.log_metadata(reason))
           %{}
       end
 

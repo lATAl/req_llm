@@ -372,7 +372,7 @@ defmodule ReqLLM.Streaming do
           metadata
 
         {:error, reason} ->
-          Logger.warning("Metadata collection failed: #{inspect(reason)}")
+          Logger.warning("Metadata collection failed", ReqLLM.Error.log_metadata(reason))
           %{error: reason}
       end
     end

@@ -2,7 +2,9 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
   use ExUnit.Case, async: true
 
   alias ReqLLM.Error.API
+  alias ReqLLM.StreamResponse.MetadataHandle
   alias ReqLLM.StreamServer
+  import ExUnit.CaptureLog
   import ReqLLM.Test.StreamServerHelpers, only: [start_server: 1]
 
   @envelope %{"error" => %{"message" => "denied", "code" => "blocked"}, "outer" => "sentinel"}
@@ -205,6 +207,85 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
     refute_receive {:chunk, %ReqLLM.StreamChunk{type: :meta}}
     assert_receive {:request, _}
     refute_receive {:request, _}
+  end
+
+  for {status, kind} <- [{429, :json}, {503, :json}, {200, :json}, {503, :binary}, {200, :binary}] do
+    test "HTTP #{status} #{kind} failure logs do not expose response data even from async metadata collection" do
+      status = unquote(status)
+      marker = "PRIVATE_PROVIDER_RESPONSE_ROUND2"
+
+      body =
+        if unquote(kind == :binary),
+          do: marker,
+          else: %{"error" => %{"message" => marker}, "nested" => %{"details" => marker}}
+
+      encoded = if unquote(kind == :binary), do: body, else: Jason.encode!(body)
+
+      chunks =
+        if status == 200,
+          do: [usage_event(15) <> "event: error\ndata: " <> encoded <> "\n\n"],
+          else: [encoded]
+
+      responses =
+        if status == 429, do: [{status, chunks}, {status, chunks}], else: [{status, chunks}]
+
+      log =
+        capture_log([format: "$metadata$message\n", metadata: [:error_type, :http_status]], fn ->
+          response = response_stream(responses, max_retries: 1)
+          assert %{error: metadata_error} = MetadataHandle.await(response.metadata_handle, 5_000)
+          assert metadata_error.response_body == body
+          error = assert_raise API.Stream, fn -> Enum.to_list(response.stream) end
+          assert error.cause == metadata_error
+          assert error.cause.status == status
+          assert error.cause.response_body == body
+
+          if status == 200 do
+            assert %API.StreamEvent{} = error.cause
+
+            assert %{input_tokens: 100, output_tokens: 15, cached_tokens: 20, reasoning_tokens: 3} =
+                     error.usage
+          else
+            assert %API.Request{} = error.cause
+            assert error.usage == nil
+          end
+
+          assert_receive {:request, _}
+          if status == 429, do: assert_receive({:request, _})
+          refute_receive {:request, _}
+        end)
+
+      refute log =~ marker
+      assert log =~ "Metadata collection failed"
+      assert log =~ "http_status=#{status}"
+      assert log =~ "error_type=ReqLLM.Error.API."
+      if status == 429, do: assert(log =~ "Finch streaming failed")
+    end
+  end
+
+  for failure <- [:raise, :exit] do
+    test "metadata handle #{failure} log excludes response and exception text" do
+      marker = "PRIVATE_METADATA_EXCEPTION_ROUND2"
+
+      error =
+        API.Request.exception(reason: marker, status: 503, response_body: %{"secret" => marker})
+
+      log =
+        capture_log(fn ->
+          {:ok, handle} =
+            MetadataHandle.start_link(fn ->
+              case unquote(failure) do
+                :raise -> raise error
+                :exit -> exit(error)
+              end
+            end)
+
+          assert %{} == MetadataHandle.await(handle, 5_000)
+          GenServer.stop(handle)
+        end)
+
+      refute log =~ marker
+      assert log =~ "Metadata collection"
+    end
   end
 
   defp usage_event(output) do
