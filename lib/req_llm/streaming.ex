@@ -171,6 +171,7 @@ defmodule ReqLLM.Streaming do
       model: model,
       protocol_parser: protocol_parser_for_transport(transport),
       fixture_path: maybe_capture_fixture(model, opts),
+      preserve_stream_errors: Keyword.get(opts, :preserve_stream_errors, false),
       completion_cleanup_after:
         Keyword.get(
           opts,

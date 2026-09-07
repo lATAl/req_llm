@@ -41,6 +41,7 @@ defmodule ReqLLM.Streaming.Retry do
         callback: callback,
         stream_opts: stream_opts,
         stream_fun: stream_fun,
+        preserve_stream_errors: Keyword.get(opts, :preserve_stream_errors, false),
         max_retries: max_retries
       },
       0
@@ -82,8 +83,12 @@ defmodule ReqLLM.Streaming.Retry do
       {:error, reason, %{status: 429} = state} when attempt < max_retries ->
         maybe_retry(params, attempt, state.callback_acc, reason, state)
 
-      {:error, _reason, %{status: 429} = state} ->
-        deliver_rate_limit_failure(state, callback)
+      {:error, reason, %{status: 429} = state} ->
+        if params.preserve_stream_errors do
+          {:error, reason, state.callback_acc}
+        else
+          deliver_rate_limit_failure(state, callback)
+        end
 
       {:error, reason, %{data_received?: false, callback_acc: callback_acc} = state}
       when attempt < max_retries ->

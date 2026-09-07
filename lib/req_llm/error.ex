@@ -276,6 +276,16 @@ defmodule ReqLLM.Error do
     end
   end
 
+  defmodule API.StreamEvent do
+    @moduledoc "A provider error event received over a successful HTTP stream, not an HTTP failure."
+    use Splode.Error,
+      fields: [:reason, :status, :response_body],
+      class: :api
+
+    @spec message(map()) :: String.t()
+    def message(%{reason: reason}), do: reason
+  end
+
   defmodule API.Stream do
     @moduledoc "Error for stream processing failures."
     use Splode.Error,

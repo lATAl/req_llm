@@ -192,6 +192,10 @@ defmodule ReqLLM.Streaming.FinchClient do
                  stream_opts
                ) do
             {:ok, _} ->
+              if Keyword.get(opts, :preserve_stream_errors, false) do
+                safe_http_event(stream_server_pid, :done)
+              end
+
               :ok
 
             {:error, reason, _callback_acc} ->
@@ -233,6 +237,7 @@ defmodule ReqLLM.Streaming.FinchClient do
       receive_timeout: receive_timeout,
       max_retries: Keyword.get(opts, :max_retries, 3)
     ]
+    |> maybe_put_option(:preserve_stream_errors, Keyword.get(opts, :preserve_stream_errors))
     |> maybe_put_option(:request_timeout, Keyword.get(opts, :request_timeout))
     |> maybe_put_option(:pool_strategy, pool_strategy(opts))
   end

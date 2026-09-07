@@ -99,6 +99,8 @@ defmodule ReqLLM.StreamServer do
     high_watermark: 500,
     headers: [],
     http_status: nil,
+    preserve_stream_errors: false,
+    http_error_body: [],
     waiting_callers: [],
     object_json_mode?: false,
     object_acc: [],
@@ -149,6 +151,7 @@ defmodule ReqLLM.StreamServer do
       provider_mod: provider_mod,
       model: model,
       protocol_parser: Keyword.get(opts, :protocol_parser),
+      preserve_stream_errors: Keyword.get(opts, :preserve_stream_errors, false),
       provider_state: provider_state,
       fixture_path: Keyword.get(opts, :fixture_path),
       fixture_backend: Keyword.get(opts, :fixture_backend, ReqLLM.Step.Fixture.Backend),
@@ -631,6 +634,16 @@ defmodule ReqLLM.StreamServer do
 
   ## Private Functions
 
+  defp process_http_event(_event, %{preserve_stream_errors: true, status: {:error, _}} = state),
+    do: {:reply, :ok, state}
+
+  defp process_http_event(:done, %{preserve_stream_errors: true, status: :done} = state),
+    do: {:reply, :ok, state}
+
+  defp process_http_event({:status, status}, %{preserve_stream_errors: true} = state) do
+    {:reply, :ok, %{state | http_status: status, headers: [], http_error_body: []}}
+  end
+
   defp process_http_event({:status, status}, state) do
     new_state = %{state | http_status: status}
     {:reply, :ok, new_state}
@@ -649,6 +662,25 @@ defmodule ReqLLM.StreamServer do
 
     new_state = %{state | headers: headers, http_context: updated_http_context}
     {:reply, :ok, new_state}
+  end
+
+  defp process_http_event(
+         {:data, chunk},
+         %{preserve_stream_errors: true, http_status: status} = state
+       )
+       when status in 400..599 do
+    {:reply, :ok, %{state | http_error_body: [chunk | state.http_error_body]}}
+  end
+
+  defp process_http_event(:done, %{preserve_stream_errors: true, http_status: status} = state)
+       when status in 400..599 do
+    body = state.http_error_body |> Enum.reverse() |> IO.iodata_to_binary()
+    error = build_http_error(status, body, state.headers, true)
+
+    process_http_event({:error, error}, %{
+      state
+      | http_error_body: []
+    })
   end
 
   defp process_http_event({:data, chunk}, state) do
@@ -716,6 +748,21 @@ defmodule ReqLLM.StreamServer do
 
   defp process_http_task_exit(%{status: :done} = state, _reason), do: state
 
+  defp process_http_task_exit(
+         %{preserve_stream_errors: true, status: {:error, _}} = state,
+         _reason
+       ),
+       do: state
+
+  defp process_http_task_exit(
+         %{preserve_stream_errors: true, http_status: status} = state,
+         reason
+       )
+       when status in 400..599 do
+    error = {:incomplete_http_response, reason}
+    state |> Map.put(:status, {:error, error}) |> maybe_emit_stream_exception(error)
+  end
+
   defp process_http_task_exit(state, reason) when reason in [:normal, :shutdown] do
     finalize_stream_with_fixture(state)
   end
@@ -762,7 +809,7 @@ defmodule ReqLLM.StreamServer do
 
     {events, new_protocol_state} = parse_protocol_events(chunk, state)
 
-    {stream_chunks, new_provider_state} = decode_protocol_events(events, state)
+    {stream_chunks, new_provider_state, error} = decode_protocol_events(events, state)
 
     new_state =
       enqueue_chunks(stream_chunks, %{
@@ -770,6 +817,7 @@ defmodule ReqLLM.StreamServer do
         | protocol_state: new_protocol_state,
           provider_state: new_provider_state
       })
+      |> fail_stream_event(error)
 
     terminated? =
       Enum.any?(events, &termination_event?/1) or
@@ -787,21 +835,54 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp decode_protocol_events(events, state) do
-    {stream_chunks, provider_state} =
-      Enum.reduce(events, {[], state.provider_state}, fn event, {chunks_acc, prov_state} ->
+    {stream_chunks, provider_state, error} =
+      Enum.reduce_while(events, {[], state.provider_state, nil}, fn event,
+                                                                    {chunks_acc, prov_state, nil} ->
         case SSE.process_sse_event(event) do
           nil ->
-            {chunks_acc, prov_state}
+            {:cont, {chunks_acc, prov_state, nil}}
 
           processed_event ->
-            {new_chunks, updated_prov_state} =
-              decode_provider_event(processed_event, state.provider_mod, state.model, prov_state)
+            if state.preserve_stream_errors and stream_error_event?(processed_event) do
+              error =
+                ReqLLM.Error.API.StreamEvent.exception(
+                  reason: "Provider returned a stream error event",
+                  status: state.http_status,
+                  response_body: processed_event.data
+                )
 
-            {prepend_chunks(new_chunks, chunks_acc), updated_prov_state}
+              {:halt, {chunks_acc, prov_state, error}}
+            else
+              {new_chunks, updated_prov_state} =
+                decode_provider_event(
+                  processed_event,
+                  state.provider_mod,
+                  state.model,
+                  prov_state
+                )
+
+              {:cont, {prepend_chunks(new_chunks, chunks_acc), updated_prov_state, nil}}
+            end
         end
       end)
 
-    {Enum.reverse(stream_chunks), provider_state}
+    {Enum.reverse(stream_chunks), provider_state, error}
+  end
+
+  defp stream_error_event?(%{data: %{"error" => error}}) when not is_nil(error), do: true
+
+  defp stream_error_event?(%{data: %{"type" => type}}) when type in ["error", "response.failed"],
+    do: true
+
+  defp stream_error_event?(%{event: "error"}), do: true
+  defp stream_error_event?(_), do: false
+
+  defp fail_stream_event(state, nil), do: state
+
+  defp fail_stream_event(state, error) do
+    state
+    |> Map.put(:status, {:error, error})
+    |> maybe_emit_stream_exception(error)
   end
 
   defp prepend_chunks(chunks, acc) do
@@ -1005,8 +1086,13 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp finalize_stream(state) do
-    state = flush_protocol_state(state)
+    state |> flush_protocol_state() |> finalize_stream_chunks()
+  end
 
+  defp finalize_stream_chunks(%{preserve_stream_errors: true, status: {:error, _}} = state),
+    do: state
+
+  defp finalize_stream_chunks(state) do
     {flush_chunks, new_provider_state} =
       if function_exported?(state.provider_mod, :flush_stream_state, 2) do
         state.provider_mod.flush_stream_state(state.model, state.provider_state)
@@ -1057,17 +1143,21 @@ defmodule ReqLLM.StreamServer do
     terminated? = Enum.any?(events, &termination_event?/1)
 
     if events != [] do
-      {stream_chunks, new_provider_state} = decode_protocol_events(events, state)
+      {stream_chunks, new_provider_state, error} = decode_protocol_events(events, state)
 
       state
       |> Map.put(:provider_state, new_provider_state)
       |> Map.put(:protocol_state, new_protocol_state)
       |> Map.put(:terminated?, state.terminated? or terminated?)
       |> then(&enqueue_chunks(stream_chunks, &1))
+      |> fail_stream_event(error)
     else
       %{state | protocol_state: new_protocol_state}
     end
   end
+
+  defp finalize_stream_with_fixture(%{preserve_stream_errors: true, status: {:error, _}} = state),
+    do: state
 
   defp finalize_stream_with_fixture(state) do
     Debug.dbug(
@@ -1294,15 +1384,15 @@ defmodule ReqLLM.StreamServer do
     %{state | completion_cleanup_timer: nil, completion_cleanup_token: nil}
   end
 
-  defp build_http_error(status, chunk, headers) do
+  defp build_http_error(status, chunk, headers, preserve_envelope? \\ false) do
     case Jason.decode(chunk) do
-      {:ok, %{"error" => error_data}} when is_map(error_data) ->
+      {:ok, %{"error" => error_data} = decoded} when is_map(error_data) ->
         message = Map.get(error_data, "message", "HTTP #{status}")
 
         ReqLLM.Error.API.Request.exception(
           reason: message,
           status: status,
-          response_body: error_data,
+          response_body: if(preserve_envelope?, do: decoded, else: error_data),
           headers: headers
         )
 

@@ -199,6 +199,11 @@ defmodule ReqLLM.Provider.Options do
                                ],
 
                                # HTTP client options
+                               preserve_stream_errors: [
+                                 type: :boolean,
+                                 doc:
+                                   "Preserve complete HTTP error bodies and raise structured SSE errors instead of terminal success metadata. Pass only for streaming calls; disabled when omitted."
+                               ],
                                receive_timeout: [
                                  type: :pos_integer,
                                  doc:
