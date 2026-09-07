@@ -562,6 +562,10 @@ defmodule ReqLLM.StreamServer do
       {nil, new_state} ->
         {:noreply, new_state}
 
+      {%{from: from, type: :next}, new_state} ->
+        GenServer.reply(from, stream_error_reply(:timeout, new_state))
+        {:noreply, new_state}
+
       {%{from: from, type: _type}, new_state} ->
         GenServer.reply(from, {:error, :timeout})
         {:noreply, new_state}
