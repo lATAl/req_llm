@@ -49,7 +49,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
       end
 
       StreamServer.http_event(server, :done)
-      assert {:error, %API.Request{} = error} = StreamServer.next(server)
+      assert {:error, %API.Request{} = error, nil} = StreamServer.next(server)
       assert error.status == status
 
       expected =
@@ -63,7 +63,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
       StreamServer.http_event(server, :done)
       StreamServer.http_event(server, {:error, :closed})
       send(server, {:DOWN, make_ref(), :process, nil, :normal})
-      assert {:error, ^error} = StreamServer.next(server)
+      assert {:error, ^error, nil} = StreamServer.next(server)
       assert {:error, ^error} = StreamServer.await_metadata(server)
       StreamServer.cancel(server)
     end
@@ -76,7 +76,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
     reason = %Mint.TransportError{reason: :closed}
     StreamServer.http_event(server, {:error, reason})
     StreamServer.http_event(server, :done)
-    assert {:error, ^reason} = StreamServer.next(server)
+    assert {:error, ^reason, nil} = StreamServer.next(server)
     StreamServer.cancel(server)
   end
 
@@ -85,7 +85,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
     StreamServer.http_event(server, {:status, 500})
     StreamServer.http_event(server, {:data, "partial"})
     send(server, {:DOWN, make_ref(), :process, nil, :normal})
-    assert {:error, {:incomplete_http_response, :normal}} = StreamServer.next(server)
+    assert {:error, {:incomplete_http_response, :normal}, nil} = StreamServer.next(server)
     StreamServer.cancel(server)
   end
 
@@ -96,7 +96,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
     StreamServer.http_event(server, {:status, 401})
     StreamServer.http_event(server, :done)
 
-    assert {:error, %API.Request{status: 401, headers: [], response_body: ""}} =
+    assert {:error, %API.Request{status: 401, headers: [], response_body: ""}, nil} =
              StreamServer.next(server)
 
     StreamServer.cancel(server)
@@ -114,7 +114,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
 
       StreamServer.http_event(server, :done)
 
-      assert {:error, %API.StreamEvent{status: 200, response_body: @envelope}} =
+      assert {:error, %API.StreamEvent{status: 200, response_body: @envelope}, nil} =
                StreamServer.next(server)
 
       StreamServer.cancel(server)
@@ -185,6 +185,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
     stream = response_stream([{401, []}])
     error = assert_raise API.Stream, fn -> Enum.to_list(stream.stream) end
     assert %API.Request{status: 401, response_body: ""} = error.cause
+    assert error.usage == nil
   end
 
   test "HTTP200 SSE error after content preserves structured cause, no successful terminal or retry" do
@@ -199,10 +200,98 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
       end
 
     assert %API.StreamEvent{status: 200, response_body: @envelope} = error.cause
+    assert error.usage == nil
     assert_receive {:chunk, %ReqLLM.StreamChunk{type: :content, text: "hello"}}
     refute_receive {:chunk, %ReqLLM.StreamChunk{type: :meta}}
     assert_receive {:request, _}
     refute_receive {:request, _}
+  end
+
+  defp usage_event(output) do
+    usage = %{
+      "prompt_tokens" => 100,
+      "completion_tokens" => output,
+      "total_tokens" => 100 + output,
+      "prompt_tokens_details" => %{"cached_tokens" => 20},
+      "completion_tokens_details" => %{"reasoning_tokens" => 3}
+    }
+
+    "data: " <> Jason.encode!(%{"usage" => usage}) <> "\n\n"
+  end
+
+  for waiting? <- [false, true], with_usage? <- [false, true] do
+    test "terminal snapshot waiting=#{waiting?} known_usage=#{with_usage?}" do
+      server = start_server(preserve_stream_errors: true)
+      StreamServer.http_event(server, {:status, 200})
+
+      if unquote(with_usage?) do
+        for output <- [10, 10, 15] do
+          StreamServer.http_event(server, {:data, usage_event(output)})
+          assert {:ok, %ReqLLM.StreamChunk{type: :meta}} = StreamServer.next(server)
+        end
+      end
+
+      expected = :sys.get_state(server).metadata[:usage]
+      ref = make_ref()
+
+      if unquote(waiting?) do
+        send(server, {:"$gen_call", {self(), ref}, {:next, 5_000}})
+        assert [%{type: :next}] = :sys.get_state(server).waiting_callers
+      end
+
+      StreamServer.http_event(server, {:data, "data: " <> Jason.encode!(@envelope) <> "\n\n"})
+
+      result =
+        if unquote(waiting?) do
+          assert_receive {^ref, reply}
+          reply
+        else
+          StreamServer.next(server)
+        end
+
+      assert {:error, %API.StreamEvent{response_body: @envelope} = cause, ^expected} = result
+
+      if unquote(with_usage?) do
+        assert %{
+                 input_tokens: 100,
+                 output_tokens: 15,
+                 total_tokens: 115,
+                 cached_tokens: 20,
+                 reasoning_tokens: 3
+               } = expected
+      else
+        assert expected == nil
+      end
+
+      StreamServer.http_event(server, :done)
+      send(server, {:DOWN, make_ref(), :process, nil, :normal})
+      send(server, {:EXIT, nil, :normal})
+      assert {:error, ^cause, ^expected} = StreamServer.next(server)
+      StreamServer.cancel(server)
+    end
+  end
+
+  for terminator <- ["\n\n", ""] do
+    test "real Finch coalesced usage and error transfers snapshot with terminator #{inspect(terminator)}" do
+      usage = Enum.map_join([10, 10, 15], &usage_event/1)
+      failure = "data: " <> Jason.encode!(@envelope) <> unquote(terminator)
+      stream = response_stream([{200, [usage <> failure]}])
+      error = assert_raise API.Stream, fn -> Enum.to_list(stream.stream) end
+
+      assert %API.StreamEvent{status: 200, response_body: @envelope} = error.cause
+
+      assert %{
+               input_tokens: 100,
+               output_tokens: 15,
+               total_tokens: 115,
+               cached_tokens: 20,
+               reasoning_tokens: 3
+             } = error.usage
+
+      refute Map.has_key?(error.cause.response_body, "usage")
+      assert_receive {:request, _}
+      refute_receive {:request, _}
+    end
   end
 
   test "429 retry policy preserves only final attempt envelope" do

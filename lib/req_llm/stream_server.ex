@@ -183,6 +183,8 @@ defmodule ReqLLM.StreamServer do
     * `{:ok, chunk}` - Next StreamChunk
     * `:halt` - Stream is complete
     * `{:error, reason}` - Error occurred
+    * `{:error, reason, usage}` - Opted-in terminal error with the internal normalized
+      usage snapshot, or nil if no usage was observed
 
   ## Examples
 
@@ -199,7 +201,8 @@ defmodule ReqLLM.StreamServer do
       end
 
   """
-  @spec next(server(), non_neg_integer()) :: {:ok, StreamChunk.t()} | :halt | {:error, any()}
+  @spec next(server(), non_neg_integer()) ::
+          {:ok, StreamChunk.t()} | :halt | {:error, any()} | {:error, any(), map() | nil}
   def next(server, timeout \\ 30_000) do
     GenServer.call(server, {:next, timeout}, :infinity)
   end
@@ -425,7 +428,7 @@ defmodule ReqLLM.StreamServer do
             end
 
           {:error, reason} ->
-            {:reply, {:error, reason}, new_state}
+            {:reply, stream_error_reply(reason, new_state), new_state}
 
           _ ->
             {:noreply, register_waiting_caller(new_state, from, :next, timeout)}
@@ -1284,7 +1287,7 @@ defmodule ReqLLM.StreamServer do
         %{state | halt_delivered?: true}
 
       {{:empty, _}, {:error, reason}} ->
-        GenServer.reply(from, {:error, reason})
+        GenServer.reply(from, stream_error_reply(reason, state))
         state
 
       {{:empty, _}, _} ->
@@ -1313,6 +1316,11 @@ defmodule ReqLLM.StreamServer do
     GenServer.reply(from, {:error, :not_ready})
     state
   end
+
+  defp stream_error_reply(reason, %{preserve_stream_errors: true} = state),
+    do: {:error, reason, state.metadata[:usage]}
+
+  defp stream_error_reply(reason, _state), do: {:error, reason}
 
   defp register_waiting_caller(state, from, type, timeout) do
     token = make_ref()

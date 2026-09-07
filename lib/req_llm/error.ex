@@ -287,9 +287,14 @@ defmodule ReqLLM.Error do
   end
 
   defmodule API.Stream do
-    @moduledoc "Error for stream processing failures."
+    @moduledoc """
+    Error for stream processing failures.
+
+    `usage` is an internal, nullable snapshot of normalized usage observed before
+    an opted-in stream failed. It is not part of the provider's response body.
+    """
     use Splode.Error,
-      fields: [:reason, :cause],
+      fields: [:reason, :cause, :usage],
       class: :api
 
     @spec message(map()) :: String.t()

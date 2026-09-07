@@ -327,6 +327,13 @@ defmodule ReqLLM.Streaming do
           :halt ->
             {:halt, %{state | exhausted?: true}}
 
+          {:error, reason, usage} ->
+            raise %ReqLLM.Error.API.Stream{
+              reason: "Stream failed: #{inspect(reason)}",
+              cause: reason,
+              usage: usage
+            }
+
           {:error, reason} ->
             raise %ReqLLM.Error.API.Stream{
               reason: "Stream failed: #{inspect(reason)}",
