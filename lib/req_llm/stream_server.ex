@@ -823,8 +823,11 @@ defmodule ReqLLM.StreamServer do
       |> fail_stream_event(error)
 
     terminated? =
-      Enum.any?(events, &termination_event?/1) or
-        Enum.any?(stream_chunks, &terminal_chunk?/1)
+      Enum.any?(events, fn event ->
+        event = if state.preserve_stream_errors, do: SSE.process_sse_event(event), else: event
+        termination_event?(event)
+      end) or
+        (not state.preserve_stream_errors and Enum.any?(stream_chunks, &terminal_chunk?/1))
 
     new_state =
       if terminated? do
@@ -846,10 +849,12 @@ defmodule ReqLLM.StreamServer do
             {:cont, {chunks_acc, prov_state, nil}}
 
           processed_event ->
-            if state.preserve_stream_errors and stream_error_event?(processed_event) do
+            reason = stream_event_error_reason(processed_event, state.preserve_stream_errors)
+
+            if reason do
               error =
                 ReqLLM.Error.API.StreamEvent.exception(
-                  reason: "Provider returned a stream error event",
+                  reason: reason,
                   status: state.http_status,
                   response_body: processed_event.data
                 )
@@ -871,6 +876,23 @@ defmodule ReqLLM.StreamServer do
 
     {Enum.reverse(stream_chunks), provider_state, error}
   end
+
+  defp stream_event_error_reason(_event, false), do: nil
+
+  defp stream_event_error_reason(event, true) do
+    cond do
+      stream_error_event?(event) -> "Provider returned a stream error event"
+      invalid_json_event?(event) -> "Provider returned invalid JSON in a stream event"
+      true -> nil
+    end
+  end
+
+  defp invalid_json_event?(%{data: "[DONE]"}), do: false
+
+  defp invalid_json_event?(%{data: data}) when is_binary(data),
+    do: match?({:error, _}, Jason.decode(data))
+
+  defp invalid_json_event?(_event), do: false
 
   defp stream_error_event?(%{data: %{"error" => error}}) when not is_nil(error), do: true
 

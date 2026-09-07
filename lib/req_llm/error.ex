@@ -277,7 +277,11 @@ defmodule ReqLLM.Error do
   end
 
   defmodule API.StreamEvent do
-    @moduledoc "A provider error event received over a successful HTTP stream, not an HTTP failure."
+    @moduledoc """
+    A provider error event or invalid JSON event received over a successful HTTP
+    stream, not an HTTP failure. `reason` is safe diagnostic text; `response_body`
+    retains the decoded event data or original invalid/binary payload.
+    """
     use Splode.Error,
       fields: [:reason, :status, :response_body],
       class: :api

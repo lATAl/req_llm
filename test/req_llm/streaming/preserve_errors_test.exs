@@ -288,7 +288,7 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
     end
   end
 
-  defp usage_event(output) do
+  defp usage_event(output, fields \\ %{}) do
     usage = %{
       "prompt_tokens" => 100,
       "completion_tokens" => output,
@@ -297,7 +297,128 @@ defmodule ReqLLM.Streaming.PreserveErrorsTest do
       "completion_tokens_details" => %{"reasoning_tokens" => 3}
     }
 
-    "data: " <> Jason.encode!(%{"usage" => usage}) <> "\n\n"
+    "data: " <> Jason.encode!(Map.put(fields, "usage", usage)) <> "\n\n"
+  end
+
+  for {kind, payload, terminator} <- [
+        {:malformed, "{\"unexpected\":BROKEN_PRIVATE_ROUND3}", "\n\n"},
+        {:truncated, "{\"choices\":[{\"delta\":{\"content\":\"PRIVATE_ROUND3", ""},
+        {:plain, "PRIVATE_ROUND3 invalid JSON without any error keyword", "\n\n"}
+      ],
+      coalesced? <- [false, true] do
+    test "real Finch #{kind} JSON coalesced=#{coalesced?} preserves raw failure and known usage safely" do
+      payload = unquote(payload)
+      content = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+      usage = Enum.map_join([10, 10, 15], &usage_event(&1, %{"choices" => []}))
+      chunks = [content, usage, "data: " <> payload <> unquote(terminator)]
+      chunks = if unquote(coalesced?), do: [IO.iodata_to_binary(chunks)], else: chunks
+
+      log =
+        capture_log(fn ->
+          stream = response_stream([{200, chunks}])
+          assert %{error: cause} = MetadataHandle.await(stream.metadata_handle, 5_000)
+          owner = self()
+
+          error =
+            assert_raise API.Stream, fn ->
+              stream.stream |> Stream.each(&send(owner, {:chunk, &1})) |> Enum.to_list()
+            end
+
+          assert %API.StreamEvent{status: 200, response_body: ^payload} = cause
+          assert error.cause == cause
+          assert Exception.message(cause) == "Provider returned invalid JSON in a stream event"
+
+          assert %{
+                   input_tokens: 100,
+                   output_tokens: 15,
+                   total_tokens: 115,
+                   cached_tokens: 20,
+                   reasoning_tokens: 3
+                 } = error.usage
+
+          assert_receive {:chunk, %ReqLLM.StreamChunk{type: :content, text: "partial"}}
+          assert_receive {:request, _}
+          refute_receive {:request, _}
+        end)
+
+      refute log =~ "PRIVATE_ROUND3"
+      assert log =~ "Metadata collection failed"
+    end
+  end
+
+  test "usage-only terminal metadata leaves next and metadata pending until a later error" do
+    server =
+      start_server(preserve_stream_errors: true, provider_mod: ReqLLM.Providers.Groq)
+
+    StreamServer.http_event(server, {:status, 200})
+    StreamServer.http_event(server, {:data, usage_event(15, %{"choices" => []})})
+
+    assert {:ok, %ReqLLM.StreamChunk{metadata: %{terminal?: true, usage: usage}}} =
+             StreamServer.next(server)
+
+    next_ref = make_ref()
+    metadata_ref = make_ref()
+    send(server, {:"$gen_call", {self(), next_ref}, {:next, 5_000}})
+    send(server, {:"$gen_call", {self(), metadata_ref}, {:await_metadata, 5_000}})
+    state = :sys.get_state(server)
+    snapshot = state.metadata[:usage]
+    assert %{input_tokens: 100, output_tokens: 15} = usage
+    refute state.status == :done
+    refute_receive {^next_ref, _}
+    refute_receive {^metadata_ref, _}
+
+    StreamServer.http_event(server, {:data, "data: " <> Jason.encode!(@envelope) <> "\n\n"})
+    assert_receive {^next_ref, {:error, %API.StreamEvent{} = cause, ^snapshot}}
+    assert_receive {^metadata_ref, {:error, ^cause}}
+    assert cause.response_body == @envelope
+    StreamServer.http_event(server, :done)
+    assert {:error, ^cause, ^snapshot} = StreamServer.next(server)
+    StreamServer.cancel(server)
+  end
+
+  for completion <- [
+        "[DONE]",
+        "{\"type\":\"message_stop\"}",
+        "{\"type\":\"response.completed\"}",
+        "{\"done\":true}",
+        :http_done
+      ] do
+    event = if completion == :http_done, do: :done, else: {:data, "data: #{completion}\n\n"}
+
+    test "usage metadata stays incremental until genuine completion #{inspect(completion)}" do
+      server = start_server(preserve_stream_errors: true, provider_mod: ReqLLM.Providers.Groq)
+      StreamServer.http_event(server, {:status, 200})
+      StreamServer.http_event(server, {:data, usage_event(15, %{"choices" => []})})
+      assert {:ok, %ReqLLM.StreamChunk{type: :meta}} = StreamServer.next(server)
+      refute :sys.get_state(server).status == :done
+
+      StreamServer.http_event(server, unquote(Macro.escape(event)))
+      assert :sys.get_state(server).status == :done
+
+      assert {:ok, %{usage: %{input_tokens: 100, output_tokens: 15}}} =
+               StreamServer.await_metadata(server)
+
+      StreamServer.cancel(server)
+    end
+  end
+
+  test "cancellation after usage without completion still stops promptly" do
+    server = start_server(preserve_stream_errors: true, provider_mod: ReqLLM.Providers.Groq)
+    StreamServer.http_event(server, {:status, 200})
+    StreamServer.http_event(server, {:data, usage_event(15, %{"choices" => []})})
+    ref = Process.monitor(server)
+    assert :ok = StreamServer.cancel(server)
+    assert_receive {:DOWN, ^ref, :process, ^server, :normal}
+  end
+
+  test "opt-out retains ignoring invalid JSON and early usage completion" do
+    server = start_server(provider_mod: ReqLLM.Providers.Groq)
+    StreamServer.http_event(server, {:status, 200})
+    StreamServer.http_event(server, {:data, "data: {broken JSON}\n\n"})
+    refute match?({:error, _}, :sys.get_state(server).status)
+    StreamServer.http_event(server, {:data, usage_event(15, %{"choices" => []})})
+    assert :sys.get_state(server).status == :done
+    StreamServer.cancel(server)
   end
 
   for waiting? <- [false, true], with_usage? <- [false, true] do
